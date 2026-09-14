@@ -41,6 +41,7 @@ explains the table and how to set each upstream up.
 | `qwen/qwen3.8-27b` | `deepinfra/Qwen/Qwen3.8-27B` | `api.deepinfra.com` | `--deepinfra` |
 | `zai/glm-5.2` | `engy/glm-5.2` | `api.engy.ai` | `--engy` |
 | `deepseek/deepseek-v4-flash-0731` | `engy/deepseek-v4-flash-0731` | `api.engy.ai` | `--engy` |
+| `deepseek/deepseek-v4.1-flash` | `engy/deepseek-v4.1-flash` | `api.engy.ai` | `--engy` |
 | `qwen/qwen3.6-35b-a3b` | `engy/qwen3.6-35b-a3b` | `api.engy.ai` | `--engy` |
 | `qwen/qwen3.8-27b` | `engy/qwen3.8-27b` | `api.engy.ai` | `--engy` |
 | `ornith/ornith-1.5-397b` | `engy/ornith-1.5-397b` | `api.engy.ai` | `--engy` |
@@ -209,6 +210,7 @@ source pair happens to equal the buyer pair:
 gmcli declare-product --provider engy --model glm-5.2 --discount-pct 5
 gmcli declare-product --provider engy --model kimi-k3 --discount-pct 5
 gmcli declare-product --provider engy --model deepseek-v4-flash-0731 --discount-pct 5
+gmcli declare-product --provider engy --model deepseek-v4.1-flash --discount-pct 5
 gmcli declare-product --provider engy --model qwen3.6-35b-a3b --discount-pct 5
 gmcli declare-product --provider engy --model qwen3.8-27b --discount-pct 5
 gmcli declare-product --provider engy --model glm-5.3 --discount-pct 5
