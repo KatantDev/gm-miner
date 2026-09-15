@@ -4,7 +4,8 @@
 //! then serves `GET /attestation/info` on a loopback address. Envoy
 //! (the miner's data plane) routes that single buyer-facing path here
 //! and the registry probes it through Envoy's public `:8080` port; the
-//! same listener answers the entrypoint's `/readyz` probe.
+//! same listener takes Envoy's own `POST /openrouter/audit` hand-offs
+//! and answers the entrypoint's `/readyz` probe.
 //!
 //! Configuration (environment):
 //!
@@ -23,14 +24,15 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use axum::routing::get;
-use axum::Router;
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use gm_azure_verify::{
     spawn_periodic_azure_verification_from_env, verify_azure_config_from_env, AzureBindingReadiness,
 };
 use gm_miner_attestd::info::AppState;
 use gm_miner_attestd::openrouter_verify::{
-    spawn_periodic_retention_verification, verify_retention_from_env, RetentionReadiness,
+    spawn_generation_audit, spawn_periodic_retention_verification, verify_retention_from_env,
+    AuditQueue, AuditRequest, RetentionReadiness,
 };
 use gm_miner_attestd::{
     attestation_info, validate_miner_id, DstackAttestationProvider, SigningKeypair,
@@ -165,13 +167,21 @@ async fn run() -> Result<()> {
         spawn_periodic_retention_verification(openrouter_keys, openrouter_fatal_tx);
     let openrouter_shutdown_rx = (openrouter_keys > 0).then_some(openrouter_fatal_rx);
 
-    let app = build_router(provider, readiness, openrouter_readiness);
+    // Per-response audit. The periodic canary above proves the account while
+    // the worker is idle; this proves it against the buyer traffic itself.
+    let (audit_fatal_tx, audit_fatal_rx) = oneshot::channel();
+    let (audit_queue, _generation_audit_task) =
+        spawn_generation_audit(openrouter_keys, audit_fatal_tx);
+    let audit_shutdown_rx = audit_queue.as_ref().map(|_| audit_fatal_rx);
+
+    let app = build_router(provider, readiness, openrouter_readiness, audit_queue);
     tracing::info!(bind_addr = %bind_addr, "miner attestation server listening");
 
     let fatal_shutdown_rx = first_fatal(
         [
             ("Azure owner-capture", azure_shutdown_rx),
             ("OpenRouter prompt-retention", openrouter_shutdown_rx),
+            ("OpenRouter served-generation audit", audit_shutdown_rx),
         ]
         .into_iter()
         .filter_map(|(label, receiver)| receiver.map(|receiver| (label, receiver)))
@@ -188,8 +198,29 @@ fn build_router(
     provider: AppState,
     azure_readiness: AzureBindingReadiness,
     openrouter_readiness: RetentionReadiness,
+    audit_queue: Option<AuditQueue>,
 ) -> Router {
-    Router::new()
+    let mut router = Router::new();
+    if let Some(queue) = audit_queue {
+        // Envoy's response filter posts the generation id here, from
+        // loopback, after the buyer already has the answer. It is accepted
+        // and queued, never awaited: the data plane must not wait on a
+        // readback that cannot complete for several seconds anyway.
+        router = router.route(
+            "/openrouter/audit",
+            post(move |Json(request): Json<AuditRequest>| {
+                let accepted = queue.submit(request.id);
+                async move {
+                    if accepted {
+                        axum::http::StatusCode::ACCEPTED
+                    } else {
+                        axum::http::StatusCode::TOO_MANY_REQUESTS
+                    }
+                }
+            }),
+        );
+    }
+    router
         .route("/attestation/info", get(attestation_info))
         .route(
             "/readyz",

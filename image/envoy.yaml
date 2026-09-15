@@ -783,6 +783,7 @@ static_resources:
                         ##  OpenRouter is a broker: the prompt reaches whichever
                         ##  downstream provider serves the model. The Lua filter
                         ##  admits only a closed model list, and attestd proves
+                        ##  at boot, on a timer and for every generation served
                         ##  that the account retains no prompt content.
                         ##
                         ##  The path is pinned, not `prefix: "/"`: the operator
@@ -1335,6 +1336,54 @@ static_resources:
                               return
                             end
                             strip_internal_headers(headers, provider)
+                          end
+
+                          -- Every OpenRouter response is audited, not just the
+                          -- timer's canary. The generation id is a RESPONSE
+                          -- header, so no body is read, streaming included.
+                          -- The hand-off is asynchronous: the record lands
+                          -- 2.7-6.1s after the response completes (measured),
+                          -- and holding the buyer's response for it would not
+                          -- protect the prompt already at the broker — only
+                          -- every request after it.
+                          function envoy_on_response(handle)
+                            local generation = handle:headers():get("x-generation-id")
+                            if generation == nil or generation == "" then
+                              return
+                            end
+                            local logged = handle:streamInfo():dynamicMetadata():get(
+                              "gm.access_log")
+                            if logged == nil or logged["provider"] ~= "openrouter" then
+                              return
+                            end
+                            -- Upstream input: it must not break the hand-off
+                            -- JSON on its way to the thing that would notice.
+                            if #generation > 128 or not generation:match("^[%w%-_]+$") then
+                              handle:logWarn(
+                                "openrouter audit: refusing a malformed x-generation-id")
+                              return
+                            end
+                            -- The record is written after the response has
+                            -- completed, so a hand-off at the headers would give
+                            -- up on a long stream before there was anything to
+                            -- read. Walking the chunks forwards each unread and
+                            -- buffers nothing.
+                            for _ in handle:bodyChunks() do
+                            end
+                            local ok, err = pcall(function()
+                              handle:httpCall(
+                                "attestd",
+                                {[":method"] = "POST",
+                                 [":path"] = "/openrouter/audit",
+                                 [":authority"] = "attestd",
+                                 ["content-type"] = "application/json"},
+                                "{\"id\":\"" .. json_escape(generation) .. "\"}",
+                                5000,
+                                true)
+                            end)
+                            if not ok then
+                              handle:logWarn("openrouter audit hand-off failed: " .. tostring(err))
+                            end
                           end
                   ## ── Graceful load shedding ──────────────────────────
                   ##  The miner's saturation signal. Without it a miner

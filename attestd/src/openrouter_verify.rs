@@ -7,16 +7,19 @@
 //! read the prompt back. Whatever comes back is a prompt the account stored.
 //! The same record says whether the generation went through a provider key
 //! the operator brought (BYOK), which puts the prompt in the operator's own
-//! provider logs; that is refused too. The gate runs before Envoy serves and
-//! again on a timer, because the settings can change while the worker is live.
+//! provider logs; that is refused too. The gate runs before Envoy serves,
+//! again on a timer, and — via [`spawn_generation_audit`] — on every
+//! generation Envoy serves, because the settings can change while the worker
+//! is live.
 
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use rand::RngCore as _;
 use reqwest::StatusCode;
 use serde::Deserialize;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 /// Upstream key env var; `;`-separated segments are separate accounts.
@@ -45,6 +48,17 @@ pub const VERIFY_INTERVAL: Duration = Duration::from_secs(900);
 /// Two intervals without a successful proof is a stall, not a blip.
 pub const STALE_AFTER: Duration = Duration::from_secs(VERIFY_INTERVAL.as_secs() * 2);
 
+/// `OpenRouter` wrote the generation record 2.7-6.1s after the response
+/// completed (measured); `/generation/content` answers 404 both before that
+/// and when nothing was stored, so an earlier readback proves nothing.
+const AUDIT_SETTLE: Duration = Duration::from_secs(8);
+const AUDIT_ATTEMPTS: u32 = 4;
+const AUDIT_QUEUE_DEPTH: usize = 4096;
+
+/// Measured from the first failed readback after a verdict, not from the last
+/// success, so an idle worker's first failure in an hour is not blind on the
+/// spot.
+const AUDIT_BLIND_LIMIT: Duration = STALE_AFTER;
 const TRANSIENT_FAILURE_LIMIT: u32 = 3;
 
 /// `Definitive` is a finding about the account and stops serving now.
@@ -216,6 +230,17 @@ fn stored_content(id: &str, body: &str) -> Result<bool> {
         ))
     })?;
     Ok(envelope.data.is_some_and(|data| data.holds_content()))
+}
+
+/// What one readback of a live generation established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditVerdict {
+    Clean,
+    Stored,
+    /// Served through a provider key the operator brought (BYOK).
+    OperatorKey,
+    /// No record yet, so a 404 from the content endpoint would mean nothing.
+    NotRecordedYet,
 }
 
 /// Who actually received the canary, for the log line.
@@ -437,6 +462,35 @@ impl RetentionVerifier {
         }
         Ok(())
     }
+
+    /// Read one live generation back. The slot that served it is not known
+    /// here and another account's generation reads as 404, so each key is
+    /// tried until one recognises the id.
+    ///
+    /// # Errors
+    /// Returns an error when a readback fails for a reason other than the
+    /// record being absent; [`classify`] says whether it may be retried.
+    pub async fn audit_generation(&self, keys: &[String], id: &str) -> Result<AuditVerdict> {
+        for key in keys {
+            let record = match self.readback(key, "/generation", id).await? {
+                Ok(response) => decode_record(response).await?,
+                Err(StatusCode::NOT_FOUND) => continue,
+                Err(status) => {
+                    return Err(transient(format!(
+                        "OpenRouter generation metadata for {id} failed with HTTP {status}"
+                    )))
+                }
+            };
+            if record.routed_through_operator_key() {
+                return Ok(AuditVerdict::OperatorKey);
+            }
+            return Ok(match self.read_content(key, id).await? {
+                Some(body) if stored_content(id, &body)? => AuditVerdict::Stored,
+                _ => AuditVerdict::Clean,
+            });
+        }
+        Ok(AuditVerdict::NotRecordedYet)
+    }
 }
 
 async fn decode_record(response: reqwest::Response) -> Result<GenerationData> {
@@ -614,6 +668,175 @@ async fn verify_all(verifier: &RetentionVerifier) -> Result<()> {
             .with_context(|| format!("OpenRouter key slot {}", index + 1))?;
     }
     Ok(())
+}
+
+/// The generation id Envoy hands over for one served `OpenRouter` response.
+#[derive(Deserialize)]
+pub struct AuditRequest {
+    pub id: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct AuditQueue {
+    submissions: mpsc::Sender<String>,
+}
+
+impl AuditQueue {
+    /// Never blocks: the buyer already has the answer, and a full queue must
+    /// not become back-pressure on the data plane.
+    #[must_use]
+    pub fn submit(&self, id: String) -> bool {
+        if self.submissions.try_send(id).is_err() {
+            tracing::warn!(
+                depth = AUDIT_QUEUE_DEPTH,
+                "OpenRouter audit queue is full; a served generation went unread",
+            );
+            return false;
+        }
+        true
+    }
+}
+
+/// Start reading back every served generation; `(None, None)` when no key is
+/// configured.
+#[must_use]
+pub fn spawn_generation_audit(
+    verified_keys: usize,
+    fatal_shutdown: oneshot::Sender<String>,
+) -> (Option<AuditQueue>, Option<tokio::task::JoinHandle<()>>) {
+    if verified_keys == 0 {
+        return (None, None);
+    }
+    let (submissions, pending) = mpsc::channel(AUDIT_QUEUE_DEPTH);
+    tracing::info!(
+        settle_secs = AUDIT_SETTLE.as_secs(),
+        blind_limit_secs = AUDIT_BLIND_LIMIT.as_secs(),
+        "auditing every served OpenRouter generation",
+    );
+    (
+        Some(AuditQueue { submissions }),
+        Some(tokio::spawn(run_generation_audit(pending, fatal_shutdown))),
+    )
+}
+
+struct PendingAudit {
+    id: String,
+    due: Instant,
+    attempts: u32,
+}
+
+enum AuditStep {
+    Continue,
+    Fatal(String),
+}
+
+async fn run_generation_audit(
+    mut pending: mpsc::Receiver<String>,
+    fatal_shutdown: oneshot::Sender<String>,
+) {
+    let verifier = match RetentionVerifier::new() {
+        Ok(verifier) => verifier,
+        Err(error) => {
+            let _ = fatal_shutdown.send(format!("build OpenRouter audit HTTP client: {error:#}"));
+            return;
+        }
+    };
+    let mut queue = VecDeque::new();
+    let mut blind_since = None;
+    loop {
+        let next_due = queue.front().map(|audit: &PendingAudit| audit.due);
+        tokio::select! {
+            submitted = pending.recv() => {
+                let Some(id) = submitted else { return };
+                queue.push_back(PendingAudit {
+                    id,
+                    due: Instant::now() + AUDIT_SETTLE,
+                    attempts: 0,
+                });
+            }
+            () = sleep_until(next_due) => {
+                let Some(audit) = queue.pop_front() else { continue };
+                let result = verifier.audit_generation(&keys_from_env(), &audit.id).await;
+                if let AuditStep::Fatal(reason) =
+                    settle_audit(audit, result, &mut queue, &mut blind_since)
+                {
+                    let _ = fatal_shutdown.send(reason);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// `blind_since` opens on the first transient failure after a verdict and
+/// closes on the next verdict of any kind: an audit that keeps failing is an
+/// audit that is not happening.
+fn settle_audit(
+    audit: PendingAudit,
+    result: Result<AuditVerdict>,
+    queue: &mut VecDeque<PendingAudit>,
+    blind_since: &mut Option<Instant>,
+) -> AuditStep {
+    let now = Instant::now();
+    match result {
+        Ok(AuditVerdict::Stored) => {
+            AuditStep::Fatal(retained_message("served generation", &audit.id))
+        }
+        Ok(AuditVerdict::OperatorKey) => {
+            AuditStep::Fatal(operator_key_message("served generation", &audit.id))
+        }
+        Ok(AuditVerdict::Clean) => {
+            *blind_since = None;
+            AuditStep::Continue
+        }
+        Ok(AuditVerdict::NotRecordedYet) => {
+            *blind_since = None;
+            retry_or_drop(audit, queue, now, "OpenRouter never recorded it")
+        }
+        Err(error) if classify(&error) == FailureKind::Definitive => {
+            AuditStep::Fatal(format!("{error:#}"))
+        }
+        Err(error) => {
+            let blind_for = now.duration_since(*blind_since.get_or_insert(now));
+            if blind_for >= AUDIT_BLIND_LIMIT {
+                return AuditStep::Fatal(format!(
+                    "OpenRouter generation audit read nothing back for {}s; last failure: \
+                     {error:#}",
+                    blind_for.as_secs()
+                ));
+            }
+            retry_or_drop(audit, queue, now, &format!("{error:#}"))
+        }
+    }
+}
+
+fn retry_or_drop(
+    mut audit: PendingAudit,
+    queue: &mut VecDeque<PendingAudit>,
+    now: Instant,
+    reason: &str,
+) -> AuditStep {
+    audit.attempts += 1;
+    if audit.attempts < AUDIT_ATTEMPTS {
+        audit.due = now + AUDIT_SETTLE;
+        queue.push_back(audit);
+    } else {
+        tracing::warn!(
+            generation_id = %audit.id,
+            attempts = audit.attempts,
+            reason,
+            "OpenRouter generation audit gave up on a served generation",
+        );
+    }
+    AuditStep::Continue
+}
+
+/// Wait until `due`, or forever while the queue is empty.
+async fn sleep_until(due: Option<Instant>) {
+    match due {
+        Some(due) => tokio::time::sleep_until(due).await,
+        None => std::future::pending().await,
+    }
 }
 
 fn nonce_hex() -> String {
@@ -913,6 +1136,174 @@ mod tests {
         assert_eq!(classify(&error), FailureKind::Definitive);
         let requests = server.received_requests().await.expect("request log");
         assert_eq!(requests.len(), 1, "no fallback after a refused key");
+    }
+
+    async fn audit_against(
+        metadata: ResponseTemplate,
+        content: ResponseTemplate,
+    ) -> Result<AuditVerdict> {
+        let server = MockServer::start().await;
+        stub(&server, "GET", "/generation/content", content).await;
+        stub(&server, "GET", "/generation", metadata).await;
+        verifier_for(&server)
+            .audit_generation(&[KEY.to_owned()], "gen-1")
+            .await
+    }
+
+    #[tokio::test]
+    async fn a_served_generation_with_stored_input_takes_the_worker_down() {
+        let verdict = audit_against(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": {}})),
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"input": {"messages": [{"role": "user", "content": "buyer prompt"}]}}
+            })),
+        )
+        .await
+        .expect("audit must complete");
+        assert_eq!(verdict, AuditVerdict::Stored);
+    }
+
+    #[tokio::test]
+    async fn a_recorded_generation_with_no_content_is_clean() {
+        let verdict = audit_against(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": {}})),
+            ResponseTemplate::new(404),
+        )
+        .await
+        .expect("audit must complete");
+        assert_eq!(verdict, AuditVerdict::Clean);
+    }
+
+    /// The failure this ordering exists to prevent: content 404s before the
+    /// record is written, exactly as it does when nothing was stored. Reading
+    /// that as clean would pass every audit by asking too early.
+    #[tokio::test]
+    async fn an_unrecorded_generation_is_not_reported_clean() {
+        let verdict = audit_against(ResponseTemplate::new(404), ResponseTemplate::new(404))
+            .await
+            .expect("audit must complete");
+        assert_eq!(verdict, AuditVerdict::NotRecordedYet);
+    }
+
+    #[tokio::test]
+    async fn a_served_generation_routed_through_the_operators_own_key_is_a_verdict() {
+        let verdict = audit_against(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"is_byok": true}
+            })),
+            ResponseTemplate::new(404),
+        )
+        .await
+        .expect("audit must complete");
+        assert_eq!(verdict, AuditVerdict::OperatorKey);
+    }
+
+    #[tokio::test]
+    async fn an_audit_the_broker_refuses_is_classified_for_the_loop() {
+        let error = audit_against(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": {}})),
+            ResponseTemplate::new(503),
+        )
+        .await
+        .expect_err("a failed readback is not a verdict");
+        assert_eq!(classify(&error), FailureKind::Transient);
+        let error = audit_against(ResponseTemplate::new(401), ResponseTemplate::new(404))
+            .await
+            .expect_err("a refused key is not a verdict");
+        assert_eq!(classify(&error), FailureKind::Definitive);
+    }
+
+    fn pending(id: &str, attempts: u32) -> PendingAudit {
+        PendingAudit {
+            id: id.to_owned(),
+            due: Instant::now(),
+            attempts,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transient_audit_failure_is_retried_then_dropped_with_a_warning() {
+        let mut queue = VecDeque::new();
+        let mut blind_since = None;
+        let step = settle_audit(
+            pending("gen-1", 0),
+            Err(transient("blip".to_owned())),
+            &mut queue,
+            &mut blind_since,
+        );
+        assert!(matches!(step, AuditStep::Continue));
+        assert_eq!(queue.len(), 1, "a transient failure is re-queued");
+        assert!(blind_since.is_some(), "the blind window opens");
+
+        let step = settle_audit(
+            pending("gen-1", AUDIT_ATTEMPTS - 1),
+            Err(transient("blip".to_owned())),
+            &mut queue,
+            &mut blind_since,
+        );
+        assert!(matches!(step, AuditStep::Continue));
+        assert_eq!(queue.len(), 1, "the last attempt is dropped, not re-queued");
+
+        let step = settle_audit(
+            pending("gen-2", 0),
+            Ok(AuditVerdict::Clean),
+            &mut queue,
+            &mut blind_since,
+        );
+        assert!(matches!(step, AuditStep::Continue));
+        assert!(blind_since.is_none(), "a verdict closes the blind window");
+    }
+
+    #[tokio::test]
+    async fn an_audit_blind_for_the_stale_horizon_takes_the_worker_down() {
+        tokio::time::pause();
+        let mut queue = VecDeque::new();
+        let mut blind_since = None;
+        let step = settle_audit(
+            pending("gen-1", 0),
+            Err(transient("blip".to_owned())),
+            &mut queue,
+            &mut blind_since,
+        );
+        assert!(matches!(step, AuditStep::Continue));
+        tokio::time::advance(AUDIT_BLIND_LIMIT).await;
+        let step = settle_audit(
+            pending("gen-2", 0),
+            Err(transient("blip".to_owned())),
+            &mut queue,
+            &mut blind_since,
+        );
+        let reason = match step {
+            AuditStep::Fatal(reason) => reason,
+            AuditStep::Continue => String::new(),
+        };
+        assert!(
+            reason.contains("read nothing back"),
+            "an audit blind for the whole horizon must be fatal: {reason:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_definitive_audit_failure_and_every_bad_verdict_are_fatal_at_once() {
+        for result in [
+            Err(definitive("refused".to_owned())),
+            Ok(AuditVerdict::Stored),
+            Ok(AuditVerdict::OperatorKey),
+        ] {
+            let mut queue = VecDeque::new();
+            let mut blind_since = None;
+            let step = settle_audit(pending("gen-1", 0), result, &mut queue, &mut blind_since);
+            assert!(matches!(step, AuditStep::Fatal(_)));
+            assert!(queue.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_full_audit_queue_sheds_instead_of_blocking_the_data_plane() {
+        let (submissions, _pending) = mpsc::channel(1);
+        let queue = AuditQueue { submissions };
+        assert!(queue.submit("gen-1".to_owned()));
+        assert!(!queue.submit("gen-2".to_owned()));
     }
 
     #[tokio::test]

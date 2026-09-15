@@ -166,6 +166,46 @@ fn run_request(rendered: &str, headers: &[(&str, &str)], env: &[(&str, &str)]) -
     lua
 }
 
+/// Drive the Lua filter's response phase. `metadata` is the `gm.access_log`
+/// namespace the request phase left behind; `body_chunks` is the body the
+/// upstream streams back, handed to the filter one chunk at a time.
+fn run_response(
+    rendered: &str,
+    headers: &[(&str, &str)],
+    metadata: &[(&str, &str)],
+    body_chunks: &[&str],
+) -> Lua {
+    let lua = Lua::new();
+    lua.globals()
+        .set(
+            "input_headers",
+            lua.create_table_from(headers.iter().copied())
+                .expect("headers"),
+        )
+        .expect("input headers");
+    lua.globals()
+        .set(
+            "input_metadata",
+            lua.create_table_from(metadata.iter().copied())
+                .expect("metadata"),
+        )
+        .expect("input metadata");
+    lua.globals()
+        .set(
+            "input_body_chunks",
+            lua.create_sequence_from(body_chunks.iter().copied())
+                .expect("body chunks"),
+        )
+        .expect("input body chunks");
+    lua.load(data_plane_lua(rendered))
+        .exec()
+        .expect("load filter");
+    lua.load(include_str!("fixtures/response_handle.lua"))
+        .exec()
+        .expect("execute response");
+    lua
+}
+
 fn execute_cloud_slot_fixture(rendered: &str, provider: &str, request_path: &str, slot_env: &str) {
     let current_key = if provider == "openai" {
         "azure-key"
@@ -1264,6 +1304,119 @@ fn openrouter_serves_nothing_until_the_key_that_gates_it_is_set() {
                 .expect("body")
                 .contains("gm_route_disabled"),
             "{path}"
+        );
+    }
+}
+
+/// The generation id rides a response *header*, so the audit costs no body
+/// read (the fixture's `handle:body()` raises), but the hand-off waits for the
+/// body to end: the record the auditor reads is written after the response
+/// completes.
+#[test]
+fn openrouter_hands_every_served_generation_to_the_in_image_auditor() {
+    let (status, _, stderr, rendered) = render_envoy([("OPENROUTER_API_KEY", "sk-or-v1-test")]);
+    assert!(status.success(), "render failed: {stderr}");
+
+    let lua = run_response(
+        &rendered,
+        &[("x-generation-id", "gen-1789466620-abc")],
+        &[("provider", "openrouter")],
+        &["data: {\"choices\":[]}\n\n", "data: [DONE]\n\n"],
+    );
+    assert_eq!(
+        lua.globals()
+            .get::<i64>("body_chunks_seen")
+            .expect("chunks"),
+        2,
+        "every chunk must stream through the filter"
+    );
+    assert!(
+        !lua.globals()
+            .get::<bool>("http_call_before_body_end")
+            .expect("hand-off position"),
+        "the hand-off must wait for the end of the body"
+    );
+    let call = lua
+        .globals()
+        .get::<mlua::Table>("http_call")
+        .expect("the served generation must be handed over");
+    assert_eq!(call.get::<String>("cluster").expect("cluster"), "attestd");
+    assert_eq!(call.get::<String>("method").expect("method"), "POST");
+    assert_eq!(
+        call.get::<String>("path").expect("path"),
+        "/openrouter/audit"
+    );
+    assert_eq!(
+        call.get::<String>("body").expect("body"),
+        r#"{"id":"gen-1789466620-abc"}"#
+    );
+    assert!(
+        call.get::<bool>("asynchronous").expect("asynchronous"),
+        "the readback cannot finish for seconds; holding the buyer's response \
+         for it would cost latency and still not protect the prompt it holds"
+    );
+}
+
+/// Two responses that must not reach the auditor: another provider's (whose
+/// retention is not `OpenRouter`'s to prove) and an `OpenRouter` error carrying no
+/// generation at all (nothing was served, so nothing could be stored).
+#[test]
+fn openrouter_audits_nothing_it_did_not_serve() {
+    let (status, _, stderr, rendered) = render_envoy([("OPENROUTER_API_KEY", "sk-or-v1-test")]);
+    assert!(status.success(), "render failed: {stderr}");
+
+    for (headers, metadata, case) in [
+        (
+            vec![("x-generation-id", "gen-1789466620-abc")],
+            vec![("provider", "deepinfra")],
+            "another provider's response",
+        ),
+        (vec![], vec![("provider", "openrouter")], "no generation id"),
+    ] {
+        let lua = run_response(&rendered, &headers, &metadata, &[]);
+        assert!(
+            lua.globals()
+                .get::<Option<mlua::Table>>("http_call")
+                .expect("call")
+                .is_none(),
+            "{case} must not be audited"
+        );
+    }
+}
+
+/// An id the auditor could not use must not break the hand-off JSON on the
+/// way to it — that would be a generation that silently went unaudited.
+#[test]
+fn openrouter_refuses_to_hand_over_a_malformed_generation_id() {
+    let (status, _, stderr, rendered) = render_envoy([("OPENROUTER_API_KEY", "sk-or-v1-test")]);
+    assert!(status.success(), "render failed: {stderr}");
+
+    let oversized = "g".repeat(129);
+    for (id, case) in [
+        (r#"gen-1"}"#, "a quote that would close the JSON string"),
+        (r"gen-1\", "a trailing backslash"),
+        ("gen 1", "whitespace"),
+        (oversized.as_str(), "an oversized id"),
+    ] {
+        let lua = run_response(
+            &rendered,
+            &[("x-generation-id", id)],
+            &[("provider", "openrouter")],
+            &[],
+        );
+        assert!(
+            lua.globals()
+                .get::<Option<mlua::Table>>("http_call")
+                .expect("call")
+                .is_none(),
+            "{case} must not be handed over"
+        );
+        assert!(
+            lua.globals()
+                .get::<Option<String>>("log_warn")
+                .expect("warning")
+                .is_some_and(|line| line.contains("malformed")),
+            "{case} must be logged, not dropped silently"
         );
     }
 }
