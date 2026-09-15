@@ -1113,7 +1113,10 @@ fn openrouter_admits_only_listed_models_and_never_forwards_the_selector() {
         let lua = run_request(
             &rendered,
             &headers,
-            &[("GM_OPENROUTER_KEY_SLOT_1", "sk-or-v1-test")],
+            &[
+                ("OPENROUTER_API_KEY", "sk-or-v1-test"),
+                ("GM_OPENROUTER_KEY_SLOT_1", "sk-or-v1-test"),
+            ],
         );
         assert_eq!(
             lua.globals()
@@ -1168,7 +1171,10 @@ fn openrouter_advertises_exactly_the_models_it_will_serve() {
             ("x-gm-provider", "openrouter"),
             ("x-gm-node-key", "test-node-secret-0001"),
         ],
-        &[("GM_OPENROUTER_KEY_SLOT_1", "sk-or-v1-test")],
+        &[
+            ("OPENROUTER_API_KEY", "sk-or-v1-test"),
+            ("GM_OPENROUTER_KEY_SLOT_1", "sk-or-v1-test"),
+        ],
     );
     assert_eq!(
         lua.globals()
@@ -1211,7 +1217,10 @@ fn openrouter_advertises_exactly_the_models_it_will_serve() {
                 ("x-gm-node-key", "test-node-secret-0001"),
                 ("x-gm-upstream-model", &model),
             ],
-            &[("GM_OPENROUTER_KEY_SLOT_1", "sk-or-v1-test")],
+            &[
+                ("OPENROUTER_API_KEY", "sk-or-v1-test"),
+                ("GM_OPENROUTER_KEY_SLOT_1", "sk-or-v1-test"),
+            ],
         );
         assert_eq!(
             lua.globals()
@@ -1219,6 +1228,42 @@ fn openrouter_advertises_exactly_the_models_it_will_serve() {
                 .expect("status"),
             None,
             "advertised {model} must pass the gate"
+        );
+    }
+}
+
+/// Every other route's disabled state is "forward and let the upstream 401",
+/// which still delivers the prompt; without a key no retention proof has run.
+#[test]
+fn openrouter_serves_nothing_until_the_key_that_gates_it_is_set() {
+    let (status, _, stderr, rendered) = render_envoy([("ANTHROPIC_API_KEY", "sk-ant")]);
+    assert!(status.success(), "render failed: {stderr}");
+
+    for path in ["/v1/chat/completions", "/v1/models"] {
+        let lua = run_request(
+            &rendered,
+            &[
+                (":path", path),
+                ("x-gm-provider", "openrouter"),
+                ("x-gm-node-key", "test-node-secret-0001"),
+                ("x-gm-upstream-model", OPENROUTER_LISTED_MODEL),
+                ("authorization", "caller-secret"),
+            ],
+            &[("ANTHROPIC_API_KEY", "sk-ant")],
+        );
+        assert_eq!(
+            lua.globals()
+                .get::<Option<String>>("response_status")
+                .expect("status"),
+            Some("501".to_owned()),
+            "{path} must be refused in the worker, not forwarded to a 401"
+        );
+        assert!(
+            lua.globals()
+                .get::<String>("response_body_text")
+                .expect("body")
+                .contains("gm_route_disabled"),
+            "{path}"
         );
     }
 }

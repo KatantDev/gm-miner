@@ -1289,6 +1289,17 @@ static_resources:
                             if provider ~= "near" or bare == "/v1/models" then
                               headers:remove("x-gm-upstream-model")
                             end
+                            if provider == "openrouter"
+                              and getenv(slot_config.openrouter.direct_env) == nil then
+                              -- Without a key the retention gate never ran, so
+                              -- the usual "forward and let the upstream 401"
+                              -- would hand the broker an unproven prompt.
+                              handle:respond(
+                                {[":status"] = "501",
+                                 ["content-type"] = "application/json"},
+                                "{\"error\":{\"type\":\"gm_route_disabled\",\"message\":\"OpenRouter is not configured on this miner\"}}")
+                              return
+                            end
                             if provider == "openrouter" and bare == "/v1/models" then
                               handle:respond(
                                 {[":status"] = "200",

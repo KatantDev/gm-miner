@@ -8,6 +8,10 @@
 #      verifies the configured Azure OpenAI account owner-capture
 #      controls before Envoy can serve Azure traffic. A failure aborts
 #      the container.
+#   0b. gm-miner-attestd --verify-openrouter-once (one-shot, OpenRouter
+#      only) — sends a nonce-carrying canary and reads it back through
+#      OpenRouter's stored-content API, proving the account keeps no copy
+#      of a prompt it served. A failure aborts the container.
 #   1. gm-miner-ratls (one-shot) — mints the data-plane RA-TLS
 #      certificate via dstack's GetTlsKey RPC and writes the key/cert
 #      PEM files envoy's :8080 DownstreamTlsContext references. Runs to
@@ -558,6 +562,21 @@ if [[ "${GM_START_RENDER_ONLY:-}" != "1" ]] &&
   log "Azure owner-capture verification passed"
 fi
 
+# ── Gate OpenRouter data-plane startup ────────────────────────────────
+# OpenRouter is a broker: the prompt reaches whichever downstream provider
+# serves the model, and the account's retention setting decides whether a
+# copy survives. No API reports that setting, so the gate measures it —
+# a canary prompt carrying a nonce, read back through the stored-content
+# API. Runs before rendering for the same reason the Azure gate does: an
+# account that retains must restart the container, not serve one buyer
+# prompt. Render-only mode is an offline config check and never starts
+# Envoy, so it skips the network round trip.
+if [[ "${GM_START_RENDER_ONLY:-}" != "1" && -n "${OPENROUTER_API_KEY:-}" ]]; then
+  log "verifying OpenRouter prompt retention before starting data plane"
+  gm-miner-attestd --verify-openrouter-once
+  log "OpenRouter prompt-retention verification passed"
+fi
+
 # ── Render the envoy config ───────────────────────────────────────────
 # Literal token replaces (awk index/substr, not gsub) so values with
 # regex- or replacement-special characters are handled verbatim. The
@@ -840,13 +859,16 @@ log "starting attestation server on ${ATTESTD_BIND_ADDR}"
 gm-miner-attestd &
 ATTESTD_PID=$!
 
-# The one-shot check predates certificate provisioning. Wait for the serving
+# The one-shot checks predate certificate provisioning. Wait for the serving
 # verifier to refresh that evidence and start its success-anchored pollers.
-if [[ "${AZURE_ENABLED}" -eq 1 ]]; then
+# Both gates re-run inside the serving attestd before it binds, so a readiness
+# answer means every configured gate has passed there too, not just in the
+# one-shots above.
+if [[ "${AZURE_ENABLED}" -eq 1 || -n "${OPENROUTER_API_KEY:-}" ]]; then
   until gm-miner-attestd --check-ready >/dev/null 2>&1; do
     if ! kill -0 "${ATTESTD_PID}" 2>/dev/null; then
       wait "${ATTESTD_PID}" || true
-      log "error: attestation server exited before Azure readiness"
+      log "error: attestation server exited before the serving gate passed"
       if [[ -n "${NEAR_PROXY_PID}" ]]; then
         kill -TERM "${NEAR_PROXY_PID}" 2>/dev/null || true
       fi
