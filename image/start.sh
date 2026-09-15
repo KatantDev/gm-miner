@@ -407,10 +407,14 @@ if [[ -n "${NEAR_API_KEY:-}" ]]; then
   HAS_KEY=1
   log "NEAR_API_KEY set (NEAR requests require the local attestation proxy)"
 fi
+if [[ -n "${OPENROUTER_API_KEY:-}" ]]; then
+  HAS_KEY=1
+  log "OPENROUTER_API_KEY set (OpenRouter requests require the account to retain no prompts)"
+fi
 
 if [[ "${HAS_KEY}" -eq 0 ]]; then
   if [[ "${ANTHROPIC_UPSTREAM}" == "direct" && "${OPENAI_UPSTREAM}" == "direct" ]]; then
-    log "error: at least one of ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY / CHUTES_API_KEY / ZAI_API_KEY / MOONSHOT_API_KEY / DEEPINFRA_API_KEY / KUBETEE_API_KEY / ENGY_API_KEY / MOONMATH_API_KEY / NEAR_API_KEY must be set"
+    log "error: at least one of ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY / CHUTES_API_KEY / ZAI_API_KEY / MOONSHOT_API_KEY / DEEPINFRA_API_KEY / KUBETEE_API_KEY / ENGY_API_KEY / MOONMATH_API_KEY / NEAR_API_KEY / OPENROUTER_API_KEY must be set"
   else
     log "error: at least one usable provider key must be set"
   fi
@@ -456,6 +460,9 @@ fi
 if [[ -n "${NEAR_API_KEY:-}" ]]; then
   fan_out_slots near NEAR_API_KEY
 fi
+if [[ -n "${OPENROUTER_API_KEY:-}" ]]; then
+  fan_out_slots openrouter OPENROUTER_API_KEY
+fi
 if [[ "${ANTHROPIC_UPSTREAM}" == "foundry" && -n "${AZURE_FOUNDRY_API_KEY:-}" ]]; then
   fan_out_slots anthropic AZURE_FOUNDRY_API_KEY
 fi
@@ -485,6 +492,8 @@ GM_MOONMATH_SLOT_MAP="$(lua_slot_map "${GM_MOONMATH_SLOT_IDS:-}" "GM_MOONMATH")"
 GM_MOONMATH_DEFAULT_SLOT_ENV="$(lua_default_slot_env "${GM_MOONMATH_SLOT_IDS:-}" "GM_MOONMATH")"
 GM_NEAR_SLOT_MAP="$(lua_slot_map "${GM_NEAR_SLOT_IDS:-}" "GM_NEAR")"
 GM_NEAR_DEFAULT_SLOT_ENV="$(lua_default_slot_env "${GM_NEAR_SLOT_IDS:-}" "GM_NEAR")"
+GM_OPENROUTER_SLOT_MAP="$(lua_slot_map "${GM_OPENROUTER_SLOT_IDS:-}" "GM_OPENROUTER")"
+GM_OPENROUTER_DEFAULT_SLOT_ENV="$(lua_default_slot_env "${GM_OPENROUTER_SLOT_IDS:-}" "GM_OPENROUTER")"
 
 # ── Resolve the benchmark upstream ────────────────────────────────────
 # The benchmark URL is hardcoded per network in this script, NOT taken
@@ -603,6 +612,8 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
   GM_MOONMATH_DEFAULT_SLOT_ENV="${GM_MOONMATH_DEFAULT_SLOT_ENV}" \
   GM_NEAR_SLOT_MAP="${GM_NEAR_SLOT_MAP}" \
   GM_NEAR_DEFAULT_SLOT_ENV="${GM_NEAR_DEFAULT_SLOT_ENV}" \
+  GM_OPENROUTER_SLOT_MAP="${GM_OPENROUTER_SLOT_MAP}" \
+  GM_OPENROUTER_DEFAULT_SLOT_ENV="${GM_OPENROUTER_DEFAULT_SLOT_ENV}" \
   GM_OPENAI_SAN_MATCH="${OPENAI_SAN_MATCH}" \
   GM_OPENAI_SAN_VALUE="${OPENAI_SAN_VALUE}" \
   GM_OPENAI_AZURE_TLS="${OPENAI_AZURE_TLS}" \
@@ -656,6 +667,8 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
     moonmath_default_slot_env = ENVIRON["GM_MOONMATH_DEFAULT_SLOT_ENV"]
     near_slot_map = ENVIRON["GM_NEAR_SLOT_MAP"]
     near_default_slot_env = ENVIRON["GM_NEAR_DEFAULT_SLOT_ENV"]
+    openrouter_slot_map = ENVIRON["GM_OPENROUTER_SLOT_MAP"]
+    openrouter_default_slot_env = ENVIRON["GM_OPENROUTER_DEFAULT_SLOT_ENV"]
     openai_san_match = ENVIRON["GM_OPENAI_SAN_MATCH"]
     openai_san_value = ENVIRON["GM_OPENAI_SAN_VALUE"]
     openai_azure_tls = (ENVIRON["GM_OPENAI_AZURE_TLS"] == "1")
@@ -722,6 +735,8 @@ GM_NODE_SECRET="${GM_NODE_SECRET:-}" \
     line = subst(line, "__GM_MOONMATH_DEFAULT_SLOT_ENV__", moonmath_default_slot_env)
     line = subst(line, "__GM_NEAR_SLOT_MAP__", near_slot_map)
     line = subst(line, "__GM_NEAR_DEFAULT_SLOT_ENV__", near_default_slot_env)
+    line = subst(line, "__GM_OPENROUTER_SLOT_MAP__", openrouter_slot_map)
+    line = subst(line, "__GM_OPENROUTER_DEFAULT_SLOT_ENV__", openrouter_default_slot_env)
     line = subst(line, "__GM_OPENAI_SAN_MATCH__", openai_san_match)
     line = subst(line, "__GM_OPENAI_SAN_VALUE__", openai_san_value)
     # Substitute the node secret last: an accepted secret may itself look like a
